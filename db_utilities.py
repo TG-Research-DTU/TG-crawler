@@ -128,6 +128,48 @@ def insert_text_message(
         db = client[db_name]
         db.TextMessage.update_one({"_id": message_key}, {"$set": payload}, upsert=True)
 
+def upsert_discovered_group(
+    group,
+    source_channel_id,
+    source_message_id,
+    execution_uuid,
+    db_name="Telegram_test",
+):
+    telegram_id = group.get("telegram_id")
+
+    if telegram_id is not None:
+        group_id = f"group:{telegram_id}"
+    else:
+        group_id = f"invite:{group['invite_fingerprint']}"
+
+    reference = {
+        "channel_id": source_channel_id,
+        "message_id": source_message_id,
+        "execution": execution_uuid,
+    }
+
+    metadata = {
+        "title": group["title"],
+        "telegram_id": telegram_id,
+    }
+    for field in ("invite_hash", "invite_fingerprint", "username"):
+        if group.get(field) is not None:
+            metadata[field] = group[field]
+
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.Group.update_one(
+            {"_id": group_id},
+            {
+                "$set": metadata,
+                # Rediscovery must not reset a group's processing state.
+                "$setOnInsert": {"processed": group.get("processed", False)},
+                "$addToSet": {
+                    "discovered_from": reference,
+                },
+            },
+            upsert=True,
+        )
 
 def insert_media_item(
     channel_id,
