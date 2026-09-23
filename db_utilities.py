@@ -38,7 +38,8 @@ def list_execution_contexts(db_name="Telegram"):
 
 
 def insert_discovered_channel(
-    channel_id, execution_uuid, db_name="Telegram", distance=None
+    channel_id, execution_uuid, db_name="Telegram", distance=None,
+    discovered_from=None,
 ):
     with MongoClient(uri) as client:
         db = client[db_name]
@@ -58,6 +59,7 @@ def insert_discovered_channel(
                     "scam": False,
                     "verified": False,
                     "n_subscribers": 0,
+                    "discovered_from": discovered_from,
                 },
             },
             upsert=True,
@@ -137,10 +139,9 @@ def upsert_discovered_group(
 ):
     telegram_id = group.get("telegram_id")
 
-    if telegram_id is not None:
-        group_id = f"group:{telegram_id}"
-    else:
-        group_id = f"invite:{group['invite_fingerprint']}"
+    if telegram_id is None:
+        raise ValueError("Unresolved invites belong in InvitationLink, not Group")
+    group_id = f"group:{telegram_id}"
 
     reference = {
         "channel_id": source_channel_id,
@@ -170,6 +171,40 @@ def upsert_discovered_group(
             },
             upsert=True,
         )
+
+def upsert_discovered_invitation(
+    invitation,
+    source_channel_id,
+    source_message_id,
+    execution_uuid,
+    db_name="Telegram_test",
+    distance=None,
+):
+    """Keep unresolved invites for later resolution without resetting their state."""
+    reference = {
+        "channel_id": source_channel_id,
+        "message_id": source_message_id,
+        "execution": execution_uuid,
+    }
+    if distance is not None:
+        reference["distance"] = distance
+
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.InvitationLink.update_one(
+            {"_id": f"invite:{invitation['invite_fingerprint']}"},
+            {
+                "$set": {
+                    "title": invitation["title"],
+                    "invite_hash": invitation["invite_hash"],
+                    "invite_fingerprint": invitation["invite_fingerprint"],
+                },
+                "$setOnInsert": {"processed": False},
+                "$addToSet": {"discovered_from": reference},
+            },
+            upsert=True,
+        )
+
 
 def insert_media_item(
     channel_id,
@@ -311,6 +346,7 @@ def export_networkx_from_mongoDB(db_name="Telegram", include_channel_info=False)
 #   - new_channel -> new channel to insert
 #   - db_name -> specify the name of the collection in MongoDB
 def insert_channel(new_channel, db_name="Telegram_test", execution_uuid=None):
+    new_channel.setdefault("discovered_from", None)
     if execution_uuid:
         new_channel["execution"] = execution_uuid
     if "_status" not in new_channel:

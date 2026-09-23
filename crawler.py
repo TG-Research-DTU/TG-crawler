@@ -130,9 +130,11 @@ def links_in_message(message):
     for candidate in candidates:
         yield from LINK_REGEX.findall(candidate)
 
-## Take telegram link, find out if it is an invite to an invite to a channel or group invite. 
-## If it is a valid invite link, add the channel or group to the db
+##Classify a link as a channel, basic group, or unresolved invitation.
+## Return metadata
+
 async def resolve_telegram_link(client, link):
+
     path = link.split("t.me/", 1)[-1]
     if path == link:
         path = link.split("telegram.me/", 1)[-1]
@@ -145,7 +147,7 @@ async def resolve_telegram_link(client, link):
             if isinstance(invite, types.ChatInvite):
                 # Valid invite, but Telegram has not supplied a chat ID.
                 return {
-                    "kind": "channel" if invite.broadcast else "group",
+                    "kind": "invitation",
                     "telegram_id": None,
                     "title": invite.title,
                     "invite_hash": invite_hash,
@@ -162,12 +164,11 @@ async def resolve_telegram_link(client, link):
             chat = await client.get_entity(username)
             join_info = {"username": getattr(chat, "username", None) or username}
 
-        if isinstance(chat, types.Chat) or (
-            isinstance(chat, types.Channel) and chat.megagroup
-        ):
-            kind = "group"
-        elif isinstance(chat, types.Channel) and chat.broadcast:
+        peer = await client.get_input_entity(chat)
+        if isinstance(peer, types.InputPeerChannel):
             kind = "channel"
+        elif isinstance(peer, types.InputPeerChat):
+            kind = "group"
         else:
             return None
 
@@ -345,17 +346,26 @@ async def download_content_by_name(limit, execution_uuid):
                                 },
                                 DB_NAME,
                             )
-                        # Save groups for later and queue channels for crawling.
+                        # Add channels discovered through links, save basic groups and unresolved invitations.
+                        # Unresolved invitations are invitations where no group or channel is returned, and need to be joined to view.
                         for link in set(links_in_message(message)):
                             resolved = await resolve_telegram_link(client, link)
                             if resolved is None:
                                 continue
 
+                            if resolved["kind"] == "invitation":
+                                db_utilities.upsert_discovered_invitation(
+                                    resolved,
+                                    source_channel_id=channel,
+                                    source_message_id=message.id,
+                                    execution_uuid=execution_uuid,
+                                    db_name=DB_NAME,
+                                    distance=current_distance + 1,
+                                )
+                                continue
+
                             if resolved["kind"] == "channel":
                                 linked_channel_id = resolved["telegram_id"]
-                                if linked_channel_id is None:
-                                    # The channel queue requires an ID; do not join invites here.
-                                    continue
                                 new_distance = current_distance + 1
                                 existing_channel = db_utilities.get_channel(
                                     linked_channel_id, execution_uuid, DB_NAME
@@ -366,6 +376,7 @@ async def download_content_by_name(limit, execution_uuid):
                                         execution_uuid,
                                         DB_NAME,
                                         distance=new_distance,
+                                        discovered_from=channel,
                                     )
                                 else:
                                     existing_distance = existing_channel.get("_distance")
