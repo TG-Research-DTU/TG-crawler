@@ -25,7 +25,7 @@ from tqdm import tqdm
 import db_utilities
 
 DB_NAME = "Telegram"
-STOP_BEFORE_UTC = datetime.datetime(2022, 1, 1, tzinfo=datetime.timezone.utc)
+STOP_BEFORE_UTC = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
 STOP_BEFORE_TIMESTAMP = STOP_BEFORE_UTC.timestamp()
 
 
@@ -129,6 +129,58 @@ def links_in_message(message):
 
     for candidate in candidates:
         yield from LINK_REGEX.findall(candidate)
+
+## Take telegram link, find out if it is an invite to an invite to a channel or group invite. 
+## If it is a valid invite link, add the channel or group to the db
+async def resolve_telegram_link(client, link):
+    path = link.split("t.me/", 1)[-1]
+    if path == link:
+        path = link.split("telegram.me/", 1)[-1]
+
+    try:
+        if path.startswith("+") or path.startswith("joinchat/"):
+            invite_hash = path[1:] if path.startswith("+") else path.split("/", 1)[1]
+            invite = await client(CheckChatInviteRequest(invite_hash))
+
+            if isinstance(invite, types.ChatInvite):
+                # Valid invite, but Telegram has not supplied a chat ID.
+                return {
+                    "kind": "channel" if invite.broadcast else "group",
+                    "telegram_id": None,
+                    "title": invite.title,
+                    "invite_hash": invite_hash,
+                    "invite_fingerprint": hashlib.sha256(
+                        invite_hash.encode()
+                    ).hexdigest(),
+                    "processed": False,
+                }
+
+            chat = invite.chat  # ChatInviteAlready or ChatInvitePeek
+            join_info = {"invite_hash": invite_hash}
+        else:
+            username = path.split("/", 1)[0]
+            chat = await client.get_entity(username)
+            join_info = {"username": getattr(chat, "username", None) or username}
+
+        if isinstance(chat, types.Chat) or (
+            isinstance(chat, types.Channel) and chat.megagroup
+        ):
+            kind = "group"
+        elif isinstance(chat, types.Channel) and chat.broadcast:
+            kind = "channel"
+        else:
+            return None
+
+        return {
+            "kind": kind,
+            "telegram_id": chat.id,
+            "title": chat.title,
+            **join_info,
+            "processed": False,
+        }
+    except (InviteHashInvalidError, InviteHashExpiredError, ValueError):
+        return None
+
 
 # Download the messages of a channel by username
 async def download_content_by_name(limit, execution_uuid):
@@ -293,74 +345,46 @@ async def download_content_by_name(limit, execution_uuid):
                                 },
                                 DB_NAME,
                             )
-                        # Get links in message, verify if they are valid Telegram group or channel links.
-                        links = set(LINK_REGEX.findall(message.raw_text or ""))
-
-                        for entity, _ in message.get_entities_text():
-                            if isinstance(entity, types.MessageEntityTextUrl):
-                                links.update(LINK_REGEX.findall(entity.url))
-
-                        for link in links:
-                            path = link.split("t.me/", 1)[-1]
-                            if path == link:
-                                path = link.split("telegram.me/", 1)[-1]
-
-                            try:
-                                if path.startswith("+") or path.startswith("joinchat/"):
-                                    invite_hash = path[1:] if path.startswith("+") else path.split("/", 1)[1]
-                                    invite = await client(CheckChatInviteRequest(invite_hash))
-
-                                    if isinstance(invite, types.ChatInvite):
-                                        # Valid invite, but Telegram has not supplied a group ID.
-                                        if invite.broadcast:
-                                            continue
-                                        group = {
-                                            "telegram_id": None,
-                                            "title": invite.title,
-                                            "invite_hash": invite_hash,
-                                            "invite_fingerprint": hashlib.sha256(
-                                                invite_hash.encode()
-                                            ).hexdigest(),
-                                            "processed": False,
-                                        }
-                                    else:
-                                        chat = invite.chat  # ChatInviteAlready or ChatInvitePeek
-                                        if not (
-                                            isinstance(chat, types.Chat)
-                                            or (isinstance(chat, types.Channel) and chat.megagroup)
-                                        ):
-                                            continue
-                                        group = {
-                                            "telegram_id": chat.id,
-                                            "title": chat.title,
-                                            "invite_hash": invite_hash,
-                                            "processed": False,
-                                        }
-                                else:
-                                    username = path.split("/", 1)[0]
-                                    chat = await client.get_entity(username)
-                                    if not (
-                                        isinstance(chat, types.Chat)
-                                        or (isinstance(chat, types.Channel) and chat.megagroup)
-                                    ):
-                                        continue
-                                    group = {
-                                        "telegram_id": chat.id,
-                                        "title": chat.title,
-                                        "username": getattr(chat, "username", None) or username,
-                                        "processed": False,
-                                    }
-
-                                db_utilities.upsert_discovered_group(
-                                    group,
-                                    source_channel_id=channel,
-                                    source_message_id=message.id,
-                                    execution_uuid=execution_uuid,
-                                    db_name=DB_NAME,
-                                )
-
-                            except (InviteHashInvalidError, InviteHashExpiredError, ValueError):
+                        # Save groups for later and queue channels for crawling.
+                        for link in set(links_in_message(message)):
+                            resolved = await resolve_telegram_link(client, link)
+                            if resolved is None:
                                 continue
+
+                            if resolved["kind"] == "channel":
+                                linked_channel_id = resolved["telegram_id"]
+                                if linked_channel_id is None:
+                                    # The channel queue requires an ID; do not join invites here.
+                                    continue
+                                new_distance = current_distance + 1
+                                existing_channel = db_utilities.get_channel(
+                                    linked_channel_id, execution_uuid, DB_NAME
+                                )
+                                if existing_channel is None:
+                                    db_utilities.insert_discovered_channel(
+                                        linked_channel_id,
+                                        execution_uuid,
+                                        DB_NAME,
+                                        distance=new_distance,
+                                    )
+                                else:
+                                    existing_distance = existing_channel.get("_distance")
+                                    db_utilities.update_channel_distance(
+                                        linked_channel_id,
+                                        execution_uuid,
+                                        min(new_distance, existing_distance)
+                                        if existing_distance is not None else new_distance,
+                                        DB_NAME,
+                                    )
+                                continue
+
+                            db_utilities.upsert_discovered_group(
+                                resolved,
+                                source_channel_id=channel,
+                                source_message_id=message.id,
+                                execution_uuid=execution_uuid,
+                                db_name=DB_NAME,
+                            )
 
                         message_date_str = datetime.datetime.fromtimestamp(
                             message_date, tz=datetime.timezone.utc
