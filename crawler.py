@@ -331,7 +331,9 @@ async def download_content_by_name(limit, execution_uuid):
             current_distance = current_channel.get("_distance")
             channel_id_for_status = channel
             try:
-                channel_peer = await try_telegram_lookup(client.get_input_entity, channel)
+                channel_peer = await try_telegram_lookup(
+                    client.get_input_entity, channel, paced=True
+                )
                 if channel_peer is None:
                     db_utilities.update_channel_status(channel, execution_uuid, "skipped", DB_NAME)
                     channels_progress.update(1)
@@ -413,42 +415,39 @@ async def download_content_by_name(limit, execution_uuid):
                         is_forwarded = False
                         forwarded_from_id = None
                         forwarded_message_date = None
+                        forwarded_from_peer = None
                         if message.forward:
                             is_forwarded = True
-                            forwarded_from_id = get_peer_id(message.forward.from_id)[0]
+                            forwarded_from_peer = message.forward.from_id
+                            forwarded_from_id = get_peer_id(forwarded_from_peer)[0]
                             forwarded_message_date = datetime.datetime.timestamp(
                                 message.forward.date
                             )
 
-                        if forwarded_from_id:
-                            # Validate that the forwarded entity is actually a channel before storing
-                            forwarded_peer = await try_telegram_lookup(
-                                client.get_input_entity, forwarded_from_id
+                        if isinstance(forwarded_from_peer, types.PeerChannel):
+                            new_distance = current_distance + 1
+                            existing_channel = db_utilities.get_channel(
+                                forwarded_from_id, execution_uuid, DB_NAME
                             )
-                            if isinstance(forwarded_peer, types.InputPeerChannel):
-                                new_distance = current_distance + 1
-                                existing_channel = db_utilities.get_channel(
-                                    forwarded_from_id, execution_uuid, DB_NAME
+                            existing_channel_distance = (
+                                existing_channel.get("_distance")
+                                if existing_channel
+                                else float("inf")
+                            )
+                            if existing_channel is not None:
+                                db_utilities.update_channel_distance(
+                                    forwarded_from_id,
+                                    execution_uuid,
+                                    min(new_distance, existing_channel_distance),
+                                    DB_NAME,
                                 )
-                                existing_channel_distance = (
-                                    existing_channel.get("_distance")
-                                    if existing_channel
-                                    else float("inf")
+                            else:
+                                db_utilities.insert_discovered_channel(
+                                    forwarded_from_id,
+                                    execution_uuid,
+                                    DB_NAME,
+                                    distance=new_distance,
                                 )
-                                if existing_channel is not None:
-                                    db_utilities.update_channel_distance(
-                                        forwarded_from_id,
-                                        execution_uuid,
-                                        min(new_distance, existing_channel_distance),
-                                        DB_NAME,
-                                    )
-                                else:
-                                    db_utilities.insert_discovered_channel(
-                                        forwarded_from_id,
-                                        execution_uuid,
-                                        DB_NAME,
-                                        distance=new_distance,
-                                    )
 
                         if message.text:
                             db_utilities.insert_text_message(

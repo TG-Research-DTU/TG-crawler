@@ -1,4 +1,7 @@
 config.ini
+seed-channels.txt
+HOWTO.txt
+*.session
 # Created by https://www.toptal.com/developers/gitignore/api/osx,linux,visualstudiocode,pycharm,python,virtualenv
 # Edit at https://www.toptal.com/developers/gitignore?templates=osx,linux,visualstudiocode,pycharm,python,virtualenv
 
