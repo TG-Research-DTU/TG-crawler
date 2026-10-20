@@ -1,22 +1,29 @@
 import argparse
+import asyncio
 import configparser
 import datetime
 import logging
 import pickle
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import urlsplit
 import re
 import hashlib
 
 from telethon.tl.functions.messages import CheckChatInviteRequest
 from telethon import TelegramClient
 from telethon.errors import (
+    ChannelInvalidError,
     ChannelPrivateError,
     FloodWaitError,
     SessionPasswordNeededError,
     InviteHashInvalidError,
-    InviteHashExpiredError
+    InviteHashExpiredError,
+    InviteHashEmptyError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
 )
 from telethon.tl import types
 from telethon.tl.functions.channels import GetFullChannelRequest
@@ -25,8 +32,15 @@ from tqdm import tqdm
 import db_utilities
 
 DB_NAME = "Telegram"
-STOP_BEFORE_UTC = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+MESSAGE_LIMIT = 5000
+MAX_INLINE_FLOOD_WAIT_SECONDS = 60
+STOP_BEFORE_UTC = datetime.datetime(2018, 1, 1, tzinfo=datetime.timezone.utc)
 STOP_BEFORE_TIMESTAMP = STOP_BEFORE_UTC.timestamp()
+# Local pacing settings, not Telegram-guaranteed request limits.
+LOOKUP_INTERVAL_SECONDS = 5.0
+LINK_CACHE_MAX_SIZE = 10000
+LINK_CACHE_TTL_SECONDS = 3600
+FAILED_LINK_CACHE_TTL_SECONDS = 600
 
 
 ######################################################
@@ -130,6 +144,108 @@ def links_in_message(message):
     for candidate in candidates:
         yield from LINK_REGEX.findall(candidate)
 
+
+class LookupPacer:
+    """Space lookup attempts, including retries, using a monotonic clock."""
+
+    def __init__(self):
+        self.next_lookup_at = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            delay = self.next_lookup_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.next_lookup_at = time.monotonic() + LOOKUP_INTERVAL_SECONDS
+
+
+lookup_pacer = LookupPacer()
+
+
+async def try_telegram_lookup(lookup, target, *, paced=False):
+    """Skip unresolvable entities and retry lookups after Telegram rate limits."""
+    while True:
+        if paced:
+            await lookup_pacer.wait()
+        try:
+            return await lookup(target)
+        except FloodWaitError as error:
+            request = getattr(error, "request", None)
+            request_name = (
+                type(request).__name__ if request is not None
+                else getattr(lookup, "__name__", type(lookup).__name__)
+            )
+            if error.seconds > MAX_INLINE_FLOOD_WAIT_SECONDS:
+                logging.warning(
+                    "Telegram %s requires a %s-second cooldown; stopping this run",
+                    request_name, error.seconds,
+                )
+                raise
+            logging.warning(
+                "Telegram %s rate limited; waiting %s seconds before retrying",
+                request_name, error.seconds,
+            )
+            await asyncio.sleep(error.seconds)
+        except (
+            UsernameInvalidError,
+            UsernameNotOccupiedError,
+            ChannelInvalidError,
+            ChannelPrivateError,
+            InviteHashEmptyError,
+            InviteHashInvalidError,
+            InviteHashExpiredError,
+            ValueError,
+        ) as error:
+            logging.warning("Skipping unresolved Telegram lookup (%s)", type(error).__name__)
+            return None
+
+
+def normalize_telegram_link(link):
+    """Canonicalize host aliases/usernames without changing invite hash case."""
+    parsed = urlsplit(link if "://" in link else "https://" + link)
+    if parsed.hostname not in ("t.me", "telegram.me"):
+        raise ValueError("Unsupported Telegram link host")
+    path = parsed.path.lstrip("/")
+    if path.startswith("joinchat/"):
+        path = "+" + path.split("/", 1)[1].split("/", 1)[0]
+    elif path.startswith("+"):
+        path = path.split("/", 1)[0]
+    else:
+        path = path.split("/", 1)[0].lower()
+    if not path or path == "+":
+        raise ValueError("Empty Telegram link")
+    return "https://t.me/" + path
+
+
+class TelegramLinkResolver:
+    """Cache link results across messages/channels for this crawl only."""
+
+    def __init__(self, client):
+        self.client = client
+        self.cache = OrderedDict()
+
+    async def resolve(self, link):
+        try:
+            key = normalize_telegram_link(link)
+        except ValueError:
+            return None
+        cached = self.cache.get(key)
+        if cached is not None:
+            expires_at, result = cached
+            if time.monotonic() < expires_at:
+                self.cache.move_to_end(key)
+                return result
+            del self.cache[key]
+
+        # Exceptions/cancellation must not be cached as invalid links.
+        result = await resolve_telegram_link(self.client, key)
+        ttl = LINK_CACHE_TTL_SECONDS if result is not None else FAILED_LINK_CACHE_TTL_SECONDS
+        self.cache[key] = (time.monotonic() + ttl, result)
+        if len(self.cache) > LINK_CACHE_MAX_SIZE:
+            self.cache.popitem(last=False)
+        return result
+
 ##Classify a link as a channel, basic group, or unresolved invitation.
 ## Return metadata
 
@@ -142,7 +258,11 @@ async def resolve_telegram_link(client, link):
     try:
         if path.startswith("+") or path.startswith("joinchat/"):
             invite_hash = path[1:] if path.startswith("+") else path.split("/", 1)[1]
-            invite = await client(CheckChatInviteRequest(invite_hash))
+            invite = await try_telegram_lookup(
+                client, CheckChatInviteRequest(invite_hash), paced=True
+            )
+            if invite is None:
+                return None
 
             if isinstance(invite, types.ChatInvite):
                 # Valid invite, but Telegram has not supplied a chat ID.
@@ -161,10 +281,19 @@ async def resolve_telegram_link(client, link):
             join_info = {"invite_hash": invite_hash}
         else:
             username = path.split("/", 1)[0]
-            chat = await client.get_entity(username)
+            # String get_entity always resolves the username over the network.
+            # get_input_entity can reuse Telethon's persistent session cache.
+            peer = await try_telegram_lookup(
+                client.get_input_entity, username, paced=True
+            )
+            if not isinstance(peer, (types.InputPeerChannel, types.InputPeerChat)):
+                return None
+            chat = await try_telegram_lookup(client.get_entity, peer, paced=True)
+            if chat is None:
+                return None
             join_info = {"username": getattr(chat, "username", None) or username}
 
-        peer = await client.get_input_entity(chat)
+        peer = await try_telegram_lookup(client.get_input_entity, chat)
         if isinstance(peer, types.InputPeerChannel):
             kind = "channel"
         elif isinstance(peer, types.InputPeerChat):
@@ -185,6 +314,7 @@ async def resolve_telegram_link(client, link):
 
 # Download the messages of a channel by username
 async def download_content_by_name(limit, execution_uuid):
+    link_resolver = TelegramLinkResolver(client)
     with tqdm(
         total=None,
         desc="Channels",
@@ -199,9 +329,13 @@ async def download_content_by_name(limit, execution_uuid):
 
             current_channel = db_utilities.get_channel(channel, execution_uuid, DB_NAME)
             current_distance = current_channel.get("_distance")
-            channel_id_for_status = None
+            channel_id_for_status = channel
             try:
-                channel_peer = await client.get_input_entity(channel)
+                channel_peer = await try_telegram_lookup(client.get_input_entity, channel)
+                if channel_peer is None:
+                    db_utilities.update_channel_status(channel, execution_uuid, "skipped", DB_NAME)
+                    channels_progress.update(1)
+                    continue
                 
                 # Validate that the entity is actually a channel
                 if not isinstance(channel_peer, types.InputPeerChannel):
@@ -213,7 +347,13 @@ async def download_content_by_name(limit, execution_uuid):
                 
                 channel = channel_peer.channel_id
                 channel_id_for_status = channel
-                channel_connect = await client.get_entity(channel)
+                channel_connect = await try_telegram_lookup(
+                    client.get_entity, channel_peer, paced=True
+                )
+                if channel_connect is None:
+                    db_utilities.update_channel_status(channel, execution_uuid, "skipped", DB_NAME)
+                    channels_progress.update(1)
+                    continue
                 title = channel_connect.title
                 n_subscribers = channel_connect.participants_count
                 creation_date = datetime.datetime.timestamp(channel_connect.date)
@@ -223,13 +363,9 @@ async def download_content_by_name(limit, execution_uuid):
                 verified = False
 
                 if type(channel_connect) is types.Channel:
-                    channel_full_info = None
-                    try:
-                        channel_full_info = await client(
-                            GetFullChannelRequest(channel=channel_connect)
-                        )
-                    except FloodWaitError as e:
-                        print("Flood waited for", e.seconds)
+                    channel_full_info = await client(
+                        GetFullChannelRequest(channel=channel_connect)
+                    )
                     description = channel_full_info.full_chat.about
                     username = channel_full_info.chats[0].username
                     is_scam = channel_full_info.chats[0].scam
@@ -258,7 +394,7 @@ async def download_content_by_name(limit, execution_uuid):
                     leave=False,
                 ) as messages_progress:
                     async for message in client.iter_messages(
-                        channel, limit=limit, wait_time=2
+                        channel, limit=effective_limit, wait_time=2
                     ):
                         message_dt = message.date
                         if message_dt.tzinfo is None:
@@ -286,7 +422,9 @@ async def download_content_by_name(limit, execution_uuid):
 
                         if forwarded_from_id:
                             # Validate that the forwarded entity is actually a channel before storing
-                            forwarded_peer = await client.get_input_entity(forwarded_from_id)
+                            forwarded_peer = await try_telegram_lookup(
+                                client.get_input_entity, forwarded_from_id
+                            )
                             if isinstance(forwarded_peer, types.InputPeerChannel):
                                 new_distance = current_distance + 1
                                 existing_channel = db_utilities.get_channel(
@@ -348,54 +486,55 @@ async def download_content_by_name(limit, execution_uuid):
                             )
                         # Add channels discovered through links, save basic groups and unresolved invitations.
                         # Unresolved invitations are invitations where no group or channel is returned, and need to be joined to view.
-                        for link in set(links_in_message(message)):
-                            resolved = await resolve_telegram_link(client, link)
-                            if resolved is None:
-                                continue
+                        
+                        # for link in set(links_in_message(message)):
+                        #     resolved = await link_resolver.resolve(link)
+                        #     if resolved is None:
+                        #         continue
 
-                            if resolved["kind"] == "invitation":
-                                db_utilities.upsert_discovered_invitation(
-                                    resolved,
-                                    source_channel_id=channel,
-                                    source_message_id=message.id,
-                                    execution_uuid=execution_uuid,
-                                    db_name=DB_NAME,
-                                    distance=current_distance + 1,
-                                )
-                                continue
+                        #     if resolved["kind"] == "invitation":
+                        #         db_utilities.upsert_discovered_invitation(
+                        #             resolved,
+                        #             source_channel_id=channel,
+                        #             source_message_id=message.id,
+                        #             execution_uuid=execution_uuid,
+                        #             db_name=DB_NAME,
+                        #             distance=current_distance + 1,
+                        #         )
+                        #         continue
 
-                            if resolved["kind"] == "channel":
-                                linked_channel_id = resolved["telegram_id"]
-                                new_distance = current_distance + 1
-                                existing_channel = db_utilities.get_channel(
-                                    linked_channel_id, execution_uuid, DB_NAME
-                                )
-                                if existing_channel is None:
-                                    db_utilities.insert_discovered_channel(
-                                        linked_channel_id,
-                                        execution_uuid,
-                                        DB_NAME,
-                                        distance=new_distance,
-                                        discovered_from=channel,
-                                    )
-                                else:
-                                    existing_distance = existing_channel.get("_distance")
-                                    db_utilities.update_channel_distance(
-                                        linked_channel_id,
-                                        execution_uuid,
-                                        min(new_distance, existing_distance)
-                                        if existing_distance is not None else new_distance,
-                                        DB_NAME,
-                                    )
-                                continue
+                        #     if resolved["kind"] == "channel":
+                        #         linked_channel_id = resolved["telegram_id"]
+                        #         new_distance = current_distance + 1
+                        #         existing_channel = db_utilities.get_channel(
+                        #             linked_channel_id, execution_uuid, DB_NAME
+                        #         )
+                        #         if existing_channel is None:
+                        #             db_utilities.insert_discovered_channel(
+                        #                 linked_channel_id,
+                        #                 execution_uuid,
+                        #                 DB_NAME,
+                        #                 distance=new_distance,
+                        #                 discovered_from=channel,
+                        #             )
+                        #         else:
+                        #             existing_distance = existing_channel.get("_distance")
+                        #             db_utilities.update_channel_distance(
+                        #                 linked_channel_id,
+                        #                 execution_uuid,
+                        #                 min(new_distance, existing_distance)
+                        #                 if existing_distance is not None else new_distance,
+                        #                 DB_NAME,
+                        #             )
+                        #         continue
 
-                            db_utilities.upsert_discovered_group(
-                                resolved,
-                                source_channel_id=channel,
-                                source_message_id=message.id,
-                                execution_uuid=execution_uuid,
-                                db_name=DB_NAME,
-                            )
+                        #     db_utilities.upsert_discovered_group(
+                        #         resolved,
+                        #         source_channel_id=channel,
+                        #         source_message_id=message.id,
+                        #         execution_uuid=execution_uuid,
+                        #         db_name=DB_NAME,
+                        #     )
 
                         message_date_str = datetime.datetime.fromtimestamp(
                             message_date, tz=datetime.timezone.utc
@@ -421,7 +560,6 @@ async def download_content_by_name(limit, execution_uuid):
                 time.sleep(1)
 
             except FloodWaitError as e:
-                print("Flood waited for", e.seconds)
                 if channel_id_for_status is not None:
                     db_utilities.update_channel_status(
                         channel_id_for_status,
@@ -429,6 +567,10 @@ async def download_content_by_name(limit, execution_uuid):
                         "unprocessed",
                         DB_NAME,
                     )
+                if e.seconds > MAX_INLINE_FLOOD_WAIT_SECONDS:
+                    raise
+                print("Flood waited for", e.seconds)
+                await asyncio.sleep(e.seconds)
             except ChannelPrivateError:
                 print("Private channel")
                 logging.warning("error with this channel " + str(channel))
@@ -494,6 +636,49 @@ def print_executions_table(db_name=DB_NAME):
         )
 
 
+async def seed_channels(channels_to_find, execution_uuid):
+    print(f"[OK] Seeding {len(channels_to_find)} channels as unprocessed")
+    for channel_username in channels_to_find:
+        channel_peer = await try_telegram_lookup(
+            client.get_input_entity, channel_username, paced=True
+        )
+        if channel_peer is None:
+            print(f"[SKIP] Could not resolve seed: {channel_username}")
+            continue
+        if isinstance(channel_peer, types.InputPeerChannel):
+            # Resuming interrupted seeding must not reset processed channels.
+            existing = db_utilities.get_channel(
+                channel_peer.channel_id, execution_uuid, DB_NAME
+            )
+            if existing is None:
+                print(
+                    f"[OK] Seeding channel: {channel_username} (ID: {channel_peer.channel_id})"
+                )
+                db_utilities.insert_discovered_channel(
+                    channel_peer.channel_id, execution_uuid, DB_NAME, distance=0
+                )
+
+
+def record_flood_wait(execution_uuid, error):
+    retry_after = int(time.time()) + error.seconds + 1
+    request = getattr(error, "request", None)
+    request_name = type(request).__name__ if request is not None else "unknown request"
+    db_utilities.update_execution_context(
+        execution_uuid,
+        {
+            "status": "rate_limited",
+            "retry_after": retry_after,
+            "rate_limited_request": request_name,
+        },
+        DB_NAME,
+    )
+    print(
+        f"[WAIT] {request_name}: retry no earlier than "
+        f"{format_timestamp(retry_after)} UTC ({error.seconds} seconds). "
+        f"Resume with: python crawler.py --resume {execution_uuid}"
+    )
+
+
 async def main(seed_file=None, resume_execution_uuid=None, list_executions=False):
     if list_executions:
         print_executions_table(DB_NAME)
@@ -522,8 +707,20 @@ async def main(seed_file=None, resume_execution_uuid=None, list_executions=False
             return
 
         execution_uuid = resume_execution_uuid
+        retry_after = execution_doc.get("retry_after") or 0
+        if retry_after > time.time():
+            print(
+                f"[WAIT] Execution is rate limited until "
+                f"{format_timestamp(retry_after)} UTC. "
+                "Restarting does not clear Telegram's cooldown."
+            )
+            return
+        if not execution_doc.get("seeding_complete", True):
+            seed_file = execution_doc.get("seed_file")
         db_utilities.update_execution_context(
-            execution_uuid, {"status": "running"}, DB_NAME
+            execution_uuid,
+            {"status": "running", "limit": MESSAGE_LIMIT, "retry_after": None},
+            DB_NAME,
         )
     else:
         execution_uuid = str(uuid.uuid4())
@@ -532,13 +729,15 @@ async def main(seed_file=None, resume_execution_uuid=None, list_executions=False
             "_id": execution_uuid,
             "seed_file": seed_file,
             "stop_before": int(STOP_BEFORE_TIMESTAMP),
-            "limit": None,
+            "limit": MESSAGE_LIMIT,
+            "seeding_complete": not bool(seed_file),
             "started_at": started_at,
             "ended_at": None,
             "status": "running",
         }
         db_utilities.insert_execution_context(execution_doc, DB_NAME)
 
+    channels_to_find = None
     if seed_file:
         try:
             channels_to_find = parse_seed_file(seed_file)
@@ -562,18 +761,16 @@ async def main(seed_file=None, resume_execution_uuid=None, list_executions=False
             )
             return
 
-        print(f"[OK] Seeding {len(channels_to_find)} channels as unprocessed")
-        for channel_username in channels_to_find:
-            channel_peer = await client.get_input_entity(channel_username)
-            if isinstance(channel_peer, types.InputPeerChannel):
-                print(
-                    f"[OK] Seeding channel: {channel_username} (ID: {channel_peer.channel_id})"
-                )
-                db_utilities.insert_discovered_channel(
-                    channel_peer.channel_id, execution_uuid, DB_NAME, distance=0
-                )
-
-    await download_content_by_name(None, execution_uuid)
+    try:
+        if channels_to_find is not None:
+            await seed_channels(channels_to_find, execution_uuid)
+            db_utilities.update_execution_context(
+                execution_uuid, {"seeding_complete": True}, DB_NAME
+            )
+        await download_content_by_name(MESSAGE_LIMIT, execution_uuid)
+    except FloodWaitError as error:
+        record_flood_wait(execution_uuid, error)
+        return
 
     ended_at = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     db_utilities.update_execution_context(
